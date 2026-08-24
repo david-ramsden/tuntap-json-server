@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Network HUB to allow network systems to communcate.
 
@@ -95,7 +95,7 @@ import json
 import socket
 import struct
 import sys
-import Queue
+import queue
 
 
 class Dump(object):
@@ -136,6 +136,7 @@ class Dump(object):
         columns = (self.columns + self.width - 1) & ~(self.width - 1)
 
         row_count = 0
+        rowtext = ''
         for offset in range(0, len(data), columns):
             if self.heading:
                 if (row_count % self.heading_every) == 0:
@@ -161,19 +162,19 @@ class Dump(object):
                                                       rowtext))
 
             rowdata = data[offset:offset + self.columns]
-            rowbytevalues = [ord(c) for c in rowdata]
+            rowbytevalues = list(bytearray(rowdata))
             if units == 1:
                 rowvalues = rowbytevalues
             else:
                 if len(rowdata) % units != 0:
-                    rowdata += '\x00' * (units - (rowdata % units))
+                    rowdata += b'\x00' * (units - (len(rowdata) % units))
                 if units == 2:
                     format_string = 'H'
                 elif units == 4:
                     format_string = 'L'
                 elif units == 8:
                     format_string = 'Q'
-                format_string = format_string * (len(rowdata) / units)
+                format_string = format_string * (len(rowdata) // units)
                 if self.little_endian:
                     format_string = '<' + format_string
                 else:
@@ -181,8 +182,8 @@ class Dump(object):
                 rowvalues = struct.unpack(format_string, rowdata)
 
             rowdesc = ' '.join('{:0{}x}'.format(v, units * 2) for v in rowvalues)
-            if len(rowvalues) < self.columns / units:
-                rowdesc += ((' ' * (units * 2)) + ' ') * (self.columns / units - len(rowvalues))
+            if len(rowvalues) < self.columns // units:
+                rowdesc += ((' ' * (units * 2)) + ' ') * (self.columns // units - len(rowvalues))
 
             if self.text:
                 rowchars = self.format_chars(rowbytevalues)
@@ -210,6 +211,7 @@ class Client(object):
     Client holds a client to whom we have connected - we exchange frames.
     """
     read_size = 1024 * 64
+    debug_etherdriverjson = False
 
     def __init__(self, socket):
         self.socket = socket
@@ -225,7 +227,7 @@ class Client(object):
                 'frame_type': frame.frame_type,
                 'src': frame.src_mac,
                 'dst': frame.dst_mac,
-                'data': base64.b64encode(frame.data),
+                'data': base64.b64encode(frame.data).decode('ascii'),
             }
         return json.dumps(send_data)
 
@@ -241,7 +243,7 @@ class Client(object):
                 raise ValueError("src address malformed (received %r)" % (src_mac,))
 
             dst_mac = recv_data['dst']
-            if not isinstance(dst_mac, list) or len(src_mac) != 6:
+            if not isinstance(dst_mac, list) or len(dst_mac) != 6:
                 raise ValueError("dst address malformed (received %r)" % (dst_mac,))
 
         except Exception as exc:
@@ -258,7 +260,7 @@ class Client(object):
             return
 
         json_data = self.frame_to_json(frame)
-        self.socket.send(json_data + "\n")
+        self.socket.sendall((json_data + "\n").encode('utf-8'))
 
     def receive(self):
         """
@@ -274,18 +276,18 @@ class Client(object):
             data = self.socket.recv(self.read_size)
         except socket.error:
             # Any socket error means that we're had a disconnect
-            data = ''
-        if data == '':
+            data = b''
+        if not data:
             # No data means that we were disconnected, so we drop the connection
             self.socket.close()
             self.socket = None
             return None
 
-        while '\n' in data:
-            (left, data) = data.split('\n', 1)
+        while b'\n' in data:
+            (left, data) = data.split(b'\n', 1)
             self.socket_read.append(left)
             try:
-                frame = self.json_to_frame(''.join(self.socket_read))
+                frame = self.json_to_frame(b''.join(self.socket_read).decode('utf-8'))
                 if frame:
                     frames.append(frame)
             except Exception as exc:
@@ -342,7 +344,7 @@ class TAP(object):
             self.name = 'filename'
         else:
             self.socket = os.open('/dev/net/tun', os.O_RDWR)
-            ifr = struct.pack('16sH', device, self.IFF_TAP | self.IFF_NO_PI)
+            ifr = struct.pack('16sH', device.encode('utf-8'), self.IFF_TAP | self.IFF_NO_PI)
             fcntl.ioctl(self.socket, self.TUNSETIFF, ifr)
             #fcntl.ioctl(self.socket, self.TUNSETOWNER, 1000)
             self.name = device
@@ -367,8 +369,8 @@ class TAP(object):
         # 2 bytes:  Ethernet type (eg 0x800)
         # ...       Payload
 
-        dst_mac = [ord(c) for c in frame[0:6]]
-        src_mac = [ord(c) for c in frame[6:12]]
+        dst_mac = list(frame[0:6])
+        src_mac = list(frame[6:12])
         (frame_type,) = struct.unpack('>H', frame[12:14])
         data = frame[14:]
 
@@ -406,7 +408,7 @@ def main():
     if tap:
         rlist.append(tap.socket)
 
-    queued_frames = Queue.LifoQueue()
+    queued_frames = queue.LifoQueue()
 
     try:
         print("Awaiting connections and packets")
@@ -464,11 +466,11 @@ def main():
                                 #if use_scapy:
                                 #    ether = Ether(frame)
                                 #    ether.show()
-                        except Queue.Empty:
+                        except queue.Empty:
                             break
 
     except KeyboardInterrupt:
-        print "HUB terminated."
+        print("HUB terminated.")
 
 
 if __name__ == '__main__':
