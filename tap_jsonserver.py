@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Network HUB to allow network systems to communcate.
+Network switch to allow network systems to communicate.
 
 This tool is intended to allow emulated systems to communicate over ethernet protocols
 without having to deal, themselves, with the tap configuration and distribution. It
@@ -27,8 +27,16 @@ Each line should be a map containing the following fields:
     'data':         Data as base 64 encoded bytes.
 
 Frames which are not recognised will be dropped.
-Each frame received will be replicated yo all the connected clients, and to the TAP if
-one is configured.
+
+This behaves as a MAC-learning Ethernet switch. Source MAC addresses are learned
+per connected client, and per the TAP if one is configured. A frame addressed to a
+known unicast MAC is delivered only to the client (or the TAP) that owns it; a
+broadcast, multicast, or unknown-unicast frame is flooded to every other connected
+client and to the TAP if configured. A MAC address already learned on one client
+cannot be claimed by another client - the second client is disconnected instead. A
+MAC learned via the TAP is not overridden by a client claiming it, and vice versa,
+until the TAP-learned entry ages out from inactivity (--tap-mac-age) or the owning
+client disconnects.
 
 
 Setting up the TAP
@@ -87,10 +95,46 @@ from select import select
 import base64
 import fcntl
 import json
+import logging
 import socket
 import struct
 import sys
+import time
 import queue
+
+
+LOG = logging.getLogger('tap_jsonserver')
+
+SELECT_TIMEOUT = 5.0  # seconds; poll granularity so select() wakes periodically
+                      # to age out stale TAP-learned MAC entries even when idle.
+
+# Cisco-IOS-style syslog severity numbers, used only in the rendered message
+# text ('%FACILITY-N-MNEMONIC: ...') - actual filtering still goes through
+# Python's own logging levels/handlers.
+_SEVERITY = {
+    logging.DEBUG: 7,
+    logging.INFO: 6,
+    logging.WARNING: 4,
+    logging.ERROR: 3,
+    logging.CRITICAL: 2,
+}
+
+
+def log_event(level, facility, mnemonic, message, *args):
+    """Emit a switch-style mnemonic log line, e.g. '%PORTSEC-4-MACCONFLICT: ...'.
+    message/args follow %-style logging conventions so formatting is skipped
+    entirely when `level` is below the configured threshold.
+
+    Whether the leading '%' needs to be doubled depends on whether logging
+    will run its own %-substitution pass at all: it only does so when args
+    is non-empty (LogRecord.getMessage() skips it entirely for an empty
+    args tuple), so an un-doubled '%' would otherwise reach the log verbatim.
+    """
+    tag = "%s-%d-%s: " % (facility, _SEVERITY[level], mnemonic)
+    if args:
+        LOG.log(level, "%%" + tag + message, *args)
+    else:
+        LOG.log(level, "%" + tag + message)
 
 
 class Frame(object):
@@ -107,6 +151,8 @@ class Client(object):
     Client holds a client to whom we have connected - we exchange frames.
     """
     read_size = 1024 * 64
+    max_pending = 1024 * 1024  # bytes buffered waiting for a '\n' before we give up
+                               # on the client - a real frame line is a couple of KB.
 
     def __init__(self, socket):
         self.socket = socket
@@ -116,6 +162,9 @@ class Client(object):
     def __repr__(self):
         return "<{}({})>".format(self.__class__.__name__,
                                  self.name)
+
+    def pending_size(self):
+        return sum(len(chunk) for chunk in self.socket_read)
 
     def frame_to_json(self, frame):
         send_data = {
@@ -188,11 +237,18 @@ class Client(object):
                 if frame:
                     frames.append(frame)
             except Exception as exc:
-                print("Could not process frame: %s" % (exc,))
+                log_event(logging.WARNING, 'FRAME', 'BADFRAME', "Could not process frame: %s", exc)
                 pass
             self.socket_read = []
         if data:
             self.socket_read.append(data)
+            if self.pending_size() > self.max_pending:
+                log_event(logging.WARNING, 'FRAME', 'OVERFLOW',
+                          "Dropping %r: %i bytes buffered with no complete line (limit %i)",
+                          self, self.pending_size(), self.max_pending)
+                self.socket.close()
+                self.socket = None
+                return None
 
         return frames
 
@@ -206,7 +262,7 @@ class Server(object):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((self.host, self.port))
-        self.socket.listen(1)
+        self.socket.listen(5)
 
     def receive(self):
         """
@@ -215,12 +271,13 @@ class Server(object):
         There's apparently someone waiting on the socket, so we need to accept their connection
         """
         try:
-            (socket, _) = self.socket.accept()
-            # We got a connection - give them a client.
-            return Client(socket)
+            (conn, _) = self.socket.accept()
+            # We got a connection - give them a client. Small, latency-sensitive
+            # frames rather than bulk transfer, so disable Nagle's algorithm.
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return Client(conn)
         except Exception as exc:
-            print("Nobody's really there?!")
-            pass
+            log_event(logging.WARNING, 'SYS', 'ACCEPTFAIL', "accept() failed: %s", exc)
         return None
 
 
@@ -229,8 +286,6 @@ class TAP(object):
 
     # Linux constants
     TUNSETIFF = 0x400454ca
-    TUNSETOWNER = TUNSETIFF + 2
-    IFF_TUN = 0x0001
     IFF_TAP = 0x0002
     IFF_NO_PI = 0x1000
 
@@ -238,12 +293,11 @@ class TAP(object):
     def __init__(self, filename='/dev/tap0', device='tap0'):
         if sys.platform == 'darwin':
             self.socket = os.open(filename, os.O_RDWR)
-            self.name = 'filename'
+            self.name = filename
         else:
             self.socket = os.open('/dev/net/tun', os.O_RDWR)
             ifr = struct.pack('16sH', device.encode('utf-8'), self.IFF_TAP | self.IFF_NO_PI)
             fcntl.ioctl(self.socket, self.TUNSETIFF, ifr)
-            #fcntl.ioctl(self.socket, self.TUNSETOWNER, 1000)
             self.name = device
 
     def __repr__(self):
@@ -255,7 +309,11 @@ class TAP(object):
         dst_mac = bytes(bytearray(frame.dst_mac))
         frame_type = struct.pack('>H', frame.frame_type)
         packet = b''.join([dst_mac, src_mac, frame_type, frame.data])
-        os.write(self.socket, packet)
+        try:
+            os.write(self.socket, packet)
+        except OSError as exc:
+            log_event(logging.WARNING, 'LINK', 'TAPWRITEFAIL',
+                      "Failed to write to tap %r: %s (dropping this frame, tap stays up)", self, exc)
 
     def receive(self):
         frame = os.read(self.socket, self.read_size)
@@ -274,6 +332,93 @@ class TAP(object):
         return [Frame(data, frame_type, src_mac, dst_mac)]
 
 
+def format_mac(mac_tuple):
+    """Render a MAC (tuple/list of 6 ints) as 'aa:bb:cc:dd:ee:ff' for logging."""
+    return ':'.join('%02x' % (b,) for b in mac_tuple)
+
+
+def purge_mac_table_for_port(mac_table, port):
+    """Remove every mac_table entry owned by `port`. Called when a Client is torn down."""
+    stale = [key for key, (owner, _expiry) in mac_table.items() if owner is port]
+    for key in stale:
+        del mac_table[key]
+
+
+def age_mac_table(mac_table):
+    """Expire TAP-owned entries whose aging deadline has passed. Client-owned
+    entries have expiry None and are never touched here."""
+    now = time.monotonic()
+    expired = [key for key, (_owner, expiry) in mac_table.items()
+               if expiry is not None and expiry <= now]
+    for key in expired:
+        log_event(logging.INFO, 'MAC', 'AGEOUT', "MAC %s aged out (TAP entry expired)", format_mac(key))
+        del mac_table[key]
+
+
+def learn_source(mac_table, sender_port, tap, src_mac, tap_mac_age):
+    """
+    Learn/refresh mac_table[tuple(src_mac)] for a frame arriving on sender_port
+    (a Client instance, or the TAP instance).
+
+    Returns:
+      'ok'       - learned/refreshed; caller should queue the frame.
+      'drop'     - frame must be dropped, no state changed. Covers a client-
+                   or TAP-owned MAC being claimed from the other side of that
+                   boundary - client<->TAP mismatches are always rejected, not
+                   relearned.
+      'conflict' - a second, different client claimed a MAC already owned by
+                   another client; caller must drop the frame AND disconnect
+                   sender_port (the new/duplicate client) - this is the only
+                   case ownership can move without a prior disconnect or
+                   aging expiry.
+    """
+    key = tuple(src_mac)
+    is_tap_sender = sender_port is tap
+    entry = mac_table.get(key)
+
+    if entry is None:
+        expiry = time.monotonic() + tap_mac_age if is_tap_sender else None
+        mac_table[key] = (sender_port, expiry)
+        return 'ok'
+
+    owner, _expiry = entry
+
+    if owner is sender_port:
+        if is_tap_sender:
+            mac_table[key] = (owner, time.monotonic() + tap_mac_age)
+        return 'ok'
+
+    owner_is_tap = owner is tap
+
+    if owner_is_tap or is_tap_sender:
+        # A client<->TAP mismatch in either direction: never let the new
+        # sender pre-empt the existing owner. The entry only changes once
+        # it ages out (TAP-owned) or the owning client disconnects.
+        log_event(logging.WARNING, 'PORTSEC', 'BOUNDARY',
+                  "MAC %s owned by %r, also seen from %r", format_mac(key), owner, sender_port)
+        return 'drop'
+
+    # Both owner and sender are (different) clients - real port-security conflict.
+    log_event(logging.WARNING, 'PORTSEC', 'MACCONFLICT',
+              "MAC %s already owned by client %r, also claimed by %r", format_mac(key), owner, sender_port)
+    return 'conflict'
+
+
+def resolve_targets(mac_table, dst_mac, ports, sender_port):
+    """Return the ports a frame with this dst_mac should be sent to (never
+    including sender_port)."""
+    if dst_mac[0] & 0x01:
+        # I/G bit set: broadcast or multicast - flood to everyone but the sender.
+        return [port for port in ports if port is not sender_port]
+
+    owner, _expiry = mac_table.get(tuple(dst_mac), (None, None))
+    if owner is None:
+        return [port for port in ports if port is not sender_port]  # unknown unicast
+    if owner is sender_port:
+        return []  # never reflect to sender
+    return [owner]
+
+
 def setup_argparse():
     parser = argparse.ArgumentParser(usage="%s [<options>]" % (os.path.basename(sys.argv[0]),),
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -285,12 +430,20 @@ def setup_argparse():
                         help="Tap filename to connect to (on macOS)")
     parser.add_argument('--tap-device', action='store', default='tap0',
                         help="Tap device to connect to (on Linux)")
+    parser.add_argument('--tap-mac-age', type=float, action='store', default=300.0,
+                        help="Seconds of inactivity before a MAC address learned via "
+                             "the tap is aged out of the switch's MAC table")
+    parser.add_argument('--log-level', action='store', default='INFO',
+                        choices=('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'),
+                        help="Logging verbosity")
     return parser
 
 
 def main():
     parser = setup_argparse()
     options = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, options.log_level), format='%(asctime)s %(message)s')
 
     server = Server(port=options.port)
     if options.tap_enable:
@@ -299,6 +452,7 @@ def main():
         tap = None
 
     clients = {}
+    mac_table = {}
     rlist = [server.socket]
     if tap:
         rlist.append(tap.socket)
@@ -306,23 +460,23 @@ def main():
     queued_frames = queue.Queue()
 
     try:
-        print("Awaiting connections and packets")
+        log_event(logging.INFO, 'SYS', 'START', "Awaiting connections and packets")
         while True:
-            (ready, _, _) = select(rlist,[],[])
-            #if ready:
-            #    print("Ready sockets: %r" % (ready,))
+            (ready, _, _) = select(rlist, [], [], SELECT_TIMEOUT)
+            age_mac_table(mac_table)
             for socket in ready:
                 if tap and socket == tap.socket:
                     frames = tap.receive()
                     if frames:
                         for frame in frames:
-                            queued_frames.put((tap, frame))
+                            if learn_source(mac_table, tap, tap, frame.src_mac, options.tap_mac_age) == 'ok':
+                                queued_frames.put((tap, frame))
 
 
                 elif socket == server.socket:
                     client = server.receive()
                     if client:
-                        print("Got a client %r" % (client,))
+                        log_event(logging.INFO, 'LINK', 'CLIENTUP', "Client %r connected", client)
                         clients[client.socket] = client
                         rlist.append(client.socket)
 
@@ -331,12 +485,24 @@ def main():
                     frames = client.receive()
                     if frames is None:
                         # They disconnected, remove from our list
-                        print("Disconnected client %r" % (client,))
+                        log_event(logging.INFO, 'LINK', 'CLIENTDOWN', "Client %r disconnected", client)
+                        purge_mac_table_for_port(mac_table, client)
                         del clients[socket]
                         rlist.remove(socket)
                     else:
                         for frame in frames:
-                            queued_frames.put((client, frame))
+                            status = learn_source(mac_table, client, tap, frame.src_mac, options.tap_mac_age)
+                            if status == 'conflict':
+                                log_event(logging.WARNING, 'PORTSEC', 'KICK',
+                                          "Disconnected client %r (duplicate MAC)", client)
+                                client.socket.close()
+                                client.socket = None
+                                purge_mac_table_for_port(mac_table, client)
+                                del clients[socket]
+                                rlist.remove(socket)
+                                break
+                            elif status == 'ok':
+                                queued_frames.put((client, frame))
 
                 # Let's try sending the frames to all the clients
                 if not queued_frames.empty():
@@ -347,14 +513,10 @@ def main():
                     while True:
                         try:
                             (receiver_port, frame) = queued_frames.get_nowait()
-                            print("Distributing frame type &%04x (%i bytes) from %r" % (frame.frame_type,
-                                                                                        len(frame.data),
-                                                                                        receiver_port,))
-                            for port in ports:
-                                if port == receiver_port:
-                                    # Never reflect frames to their sender
-                                    continue
-                                print("Transmit to port %r" % (port,))
+                            log_event(logging.DEBUG, 'FRAME', 'DISTRIB', "type &%04x (%i bytes) from %r",
+                                      frame.frame_type, len(frame.data), receiver_port)
+                            for port in resolve_targets(mac_table, frame.dst_mac, ports, receiver_port):
+                                log_event(logging.DEBUG, 'FRAME', 'TX', "to port %r", port)
                                 port.transmit(frame)
                         except queue.Empty:
                             break
@@ -363,12 +525,13 @@ def main():
                     # drop it the same way a failed receive() would.
                     for stale_socket, stale_client in list(clients.items()):
                         if not stale_client.socket:
-                            print("Disconnected client %r" % (stale_client,))
+                            log_event(logging.INFO, 'LINK', 'CLIENTDOWN', "Client %r disconnected", stale_client)
+                            purge_mac_table_for_port(mac_table, stale_client)
                             del clients[stale_socket]
                             rlist.remove(stale_socket)
 
     except KeyboardInterrupt:
-        print("HUB terminated.")
+        log_event(logging.INFO, 'SYS', 'SHUTDOWN', "Switch terminated.")
 
 
 if __name__ == '__main__':

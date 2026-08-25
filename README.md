@@ -14,7 +14,12 @@ The TCP server listens on port 33445 by default, awaiting connections from clien
 * `dst`:          Destination MAC address as a list of 6 integers.
 * `data`:         Data as base 64 encoded bytes.
 
-Any frames sent to the server will be replicated other connected clients, including the tap if present.
+The server behaves as a MAC-learning Ethernet switch. Source MAC addresses are learned per connected client, and per the tap if one is configured:
+
+* A frame addressed to a known unicast MAC is delivered only to the client (or the tap) that owns it.
+* Broadcast, multicast, and frames addressed to an unknown MAC are flooded to every other connected client, and to the tap if configured.
+* A MAC address already learned on one client cannot be claimed by another client - the second client is disconnected instead.
+* A MAC address learned via the tap is not overridden by a client claiming it, and vice versa, until the tap-learned entry ages out from inactivity (`--tap-mac-age`, default 300 seconds) or the owning client disconnects.
 
 
 ## Usage
