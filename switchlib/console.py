@@ -32,6 +32,10 @@ class CLIServer(object):
     def receive(self):
         try:
             (conn, _) = self.socket.accept()
+            # Non-blocking so a stalled console peer can never block the
+            # main select() loop - same discipline as Client, see
+            # Client.flush().
+            conn.setblocking(False)
             return CLISession(conn)
         except Exception as exc:
             log_event(logging.WARNING, 'SYS', 'CLIACCEPTFAIL', "CLI accept() failed: %s", exc)
@@ -48,10 +52,12 @@ class CLISession(object):
     JSON frame protocol used by Client."""
     read_size = 4096
     max_pending = 64 * 1024  # a command line is short; this is just a safety cap
+    max_write_pending = 1024 * 1024  # bytes queued for a slow/stalled console before we give up
 
     def __init__(self, sock):
         self.socket = sock
         self.buffer = b''
+        self.write_buffer = bytearray()
 
     def __repr__(self):
         return "<CLISession(fd=%s)>" % (self.socket.fileno() if self.socket else 'closed',)
@@ -82,14 +88,41 @@ class CLISession(object):
             return None
         return lines
 
+    def wants_write(self):
+        """Whether the main loop should watch this session for writability."""
+        return bool(self.socket) and bool(self.write_buffer)
+
     def send(self, text):
         if not self.socket:
             return
+        self.write_buffer += text.encode('utf-8')
+        self.flush()
+
+    def flush(self):
+        """Send as much of the buffered output as the socket will accept
+        right now, without blocking. The main loop calls this again once
+        select() reports the socket writable, to drain the rest - same
+        discipline as Client.flush()."""
+        if not self.socket or not self.write_buffer:
+            return
         try:
-            self.socket.sendall(text.encode('utf-8'))
+            sent = self.socket.send(self.write_buffer)
+            del self.write_buffer[:sent]
+        except BlockingIOError:
+            # Nothing went out, but a peer that never reads at all still
+            # needs to hit the overflow check below eventually.
+            pass
         except OSError:
             # Same discipline as Client.transmit()/TAP.transmit(): never let
             # a dead peer's write failure escape into the main loop.
+            self.socket.close()
+            self.socket = None
+            return
+
+        if len(self.write_buffer) > self.max_write_pending:
+            log_event(logging.WARNING, 'SYS', 'CLIWRITEOVERFLOW',
+                      "Dropping %r: %i bytes queued for a slow console (limit %i)",
+                      self, len(self.write_buffer), self.max_write_pending)
             self.socket.close()
             self.socket = None
 

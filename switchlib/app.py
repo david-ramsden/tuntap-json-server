@@ -65,6 +65,19 @@ def _drop_dead_clients(clients, rlist, mac_table):
             rlist.remove(stale_socket)
 
 
+def _drop_dead_cli_sessions(cli_sessions, rlist):
+    """Remove any CLI session whose socket was closed by a failed send()/
+    flush() (a receive() failure or the exit command already clean up their
+    own session immediately, since that's the one being processed right
+    there - this only catches a write failure discovered asynchronously,
+    e.g. via the writable-set flush())."""
+    for stale_socket, stale_session in list(cli_sessions.items()):
+        if not stale_session.socket:
+            log_event(logging.INFO, 'LINK', 'CLIDOWN', "CLI session %r disconnected", stale_session)
+            del cli_sessions[stale_socket]
+            rlist.remove(stale_socket)
+
+
 def main():
     parser = setup_argparse()
     options = parser.parse_args()
@@ -93,6 +106,7 @@ def main():
         log_event(logging.INFO, 'SYS', 'START', "Awaiting connections and packets")
         while True:
             wlist = [sock for sock, client in clients.items() if client.wants_write()]
+            wlist.extend(sock for sock, session in cli_sessions.items() if session.wants_write())
             if tap and tap.wants_write():
                 wlist.append(tap.socket)
             (ready, writable, _) = select(rlist, wlist, [], SELECT_TIMEOUT)
@@ -108,9 +122,12 @@ def main():
             for sock in writable:
                 if tap and sock == tap.socket:
                     tap.flush()
+                elif sock in cli_sessions:
+                    cli_sessions[sock].flush()
                 else:
                     clients[sock].flush()
             _drop_dead_clients(clients, rlist, mac_table)
+            _drop_dead_cli_sessions(cli_sessions, rlist)
 
             for socket in ready:
                 if tap and socket == tap.socket:
@@ -198,6 +215,11 @@ def main():
                                 break
                             elif status == 'ok':
                                 queued_frames.append((client, frame))
+
+                # A send() above (new-session prompt, command output) may
+                # have discovered a dead console peer; drop it the same way
+                # a failed receive() would.
+                _drop_dead_cli_sessions(cli_sessions, rlist)
 
                 # Let's try sending the frames to all the clients
                 if queued_frames:
