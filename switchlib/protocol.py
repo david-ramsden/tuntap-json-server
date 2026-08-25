@@ -9,6 +9,7 @@ import os
 import socket
 import struct
 import sys
+from collections import deque
 
 from .logutil import log_event
 
@@ -244,7 +245,12 @@ class TAP(object):
             ifr = struct.pack('16sH', device.encode('utf-8'), self.IFF_TAP | self.IFF_NO_PI)
             fcntl.ioctl(self.socket, self.TUNSETIFF, ifr)
         self.name = device
-        self.write_buffer = bytearray()
+        # A queue of whole frames, not a byte stream: a tap write() is
+        # packet-oriented, so each os.write() call must be exactly one
+        # frame - concatenating two queued frames into a single write()
+        # would hand the kernel one malformed packet instead of two.
+        self.write_queue = deque()
+        self._queued_bytes = 0
 
     def __repr__(self):
         return "<{}({})>".format(self.__class__.__name__,
@@ -252,37 +258,51 @@ class TAP(object):
 
     def wants_write(self):
         """Whether the main loop should watch this tap for writability."""
-        return bool(self.write_buffer)
+        return bool(self.write_queue)
 
     def transmit(self, frame):
         packet = frame.to_ethernet_bytes()
-        if len(self.write_buffer) + len(packet) > self.max_write_pending:
+        if self._queued_bytes + len(packet) > self.max_write_pending:
             # Unlike a slow Client, there's no connection to drop here - the
             # tap has to stay up. So the tap's own equivalent of a NIC's tx
             # ring dropping packets under congestion is to drop the newest
-            # frame rather than let the buffer grow without bound.
+            # frame rather than let the queue grow without bound.
             log_event(logging.WARNING, 'LINK', 'TAPOVERFLOW',
                       "Dropping frame to tap %r: %i bytes already queued for a congested tap (limit %i)",
-                      self, len(self.write_buffer), self.max_write_pending)
+                      self, self._queued_bytes, self.max_write_pending)
             return
-        self.write_buffer += packet
+        self.write_queue.append(packet)
+        self._queued_bytes += len(packet)
         self.flush()
 
     def flush(self):
-        """Send as much of the buffered output as the tap will accept right
+        """Send as many complete queued frames as the tap will accept right
         now, without blocking. The main loop calls this again once select()
-        reports the tap writable, to drain the rest."""
-        if not self.write_buffer:
-            return
-        try:
-            sent = os.write(self.socket, self.write_buffer)
-            del self.write_buffer[:sent]
-        except BlockingIOError:
-            return
-        except OSError as exc:
-            log_event(logging.WARNING, 'LINK', 'TAPWRITEFAIL',
-                      "Failed to write to tap %r: %s (dropping queued data, tap stays up)", self, exc)
-            self.write_buffer.clear()
+        reports the tap writable, to drain the rest. Each frame is written
+        whole or not at all - never partially, which would otherwise corrupt
+        the frame boundary for whatever's queued behind it."""
+        while self.write_queue:
+            packet = self.write_queue[0]
+            try:
+                sent = os.write(self.socket, packet)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                log_event(logging.WARNING, 'LINK', 'TAPWRITEFAIL',
+                          "Failed to write to tap %r: %s (dropping this frame, tap stays up)", self, exc)
+                self.write_queue.popleft()
+                self._queued_bytes -= len(packet)
+                continue
+            if sent != len(packet):
+                # A tap write is defined to be exactly one packet - if the
+                # kernel ever only takes part of one, there's no way to send
+                # the rest without corrupting whatever frame comes next, so
+                # drop it whole rather than risk desyncing the tap.
+                log_event(logging.WARNING, 'LINK', 'TAPSHORTWRITE',
+                          "Short write to tap %r: %i of %i bytes (dropping this frame)",
+                          self, sent, len(packet))
+            self.write_queue.popleft()
+            self._queued_bytes -= len(packet)
 
     def receive(self):
         try:
