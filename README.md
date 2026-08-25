@@ -88,6 +88,18 @@ Create a bridge for your interfaces you will group together:
 * `brctl addif br0 <bridged interface>`
 * `brctl addif br0 <tap interface>`
 
+## Packet capture
+
+Every run of the switch also opens a FIFO called `mirror0`, next to the script itself (fixed, not configurable, and gitignored). Every frame passing through the switch is mirrored to it as a live pcap stream - like a SPAN/mirror port on a real switch. Point a capture tool at it directly:
+
+    tshark -i mirror0
+
+or:
+
+    wireshark -k -i mirror0
+
+It's best-effort: with nothing reading the FIFO, or a reader that can't keep up, frames are silently dropped rather than adding any delay to the switch's actual job of moving traffic. Restarting the capture tool is safe - a new reader always gets a fresh pcap header rather than a corrupted stream.
+
 ## Console
 
 Every run of the switch opens a console on a Unix domain socket called `console0`, next to the script itself (fixed, not configurable, and gitignored). Connect to it locally with `socat`:

@@ -1,5 +1,5 @@
 """Argument parsing and the main select() event loop that ties the protocol,
-switching, and console pieces together."""
+switching, console, and mirror pieces together."""
 
 import argparse
 import logging

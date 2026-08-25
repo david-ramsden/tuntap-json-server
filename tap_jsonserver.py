@@ -3,7 +3,8 @@
 Network switch to allow network systems to communicate.
 
 See README.md for the full description of the switch's behaviour (MAC
-learning, port security, CLI console) and TAP setup instructions.
+learning, port security, CLI console, packet capture) and TAP setup
+instructions.
 
 
 Transmission format
