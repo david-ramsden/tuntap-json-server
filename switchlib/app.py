@@ -1,0 +1,187 @@
+"""Argument parsing and the main select() event loop that ties the protocol,
+switching, and console pieces together."""
+
+import argparse
+import logging
+import os
+import queue
+import sys
+from select import select
+
+from .console import CLIServer, resolve_cli_command
+from .logutil import log_event
+from .protocol import Server, TAP
+from .switching import age_mac_table, learn_source, purge_mac_table_for_port, resolve_targets
+
+
+SELECT_TIMEOUT = 5.0  # seconds; poll granularity so select() wakes periodically
+                      # to age out stale TAP-learned MAC entries even when idle.
+
+
+def _cli_socket_path():
+    # Next to the originally-invoked script, regardless of which module this
+    # function itself happens to live in - sys.argv[0], not __file__.
+    return os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'console0')
+
+
+def setup_argparse():
+    parser = argparse.ArgumentParser(usage="%s [<options>]" % (os.path.basename(sys.argv[0]),),
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--port', type=int, action='store', default=33445,
+                        help="Port to listen for connections on")
+    parser.add_argument('--tap-device', action='store', default=None,
+                        help="Tap device to attach to: a file path on macOS, "
+                             "an interface name on Linux. Supplying this enables "
+                             "the tap; omit it to run without one")
+    parser.add_argument('--tap-mac-age', type=float, action='store', default=300.0,
+                        help="Seconds of inactivity before a MAC address learned via "
+                             "the tap is aged out of the switch's MAC table")
+    parser.add_argument('--log-level', action='store', default='INFO',
+                        choices=('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'),
+                        help="Logging verbosity")
+    return parser
+
+
+def main():
+    parser = setup_argparse()
+    options = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, options.log_level), format='%(asctime)s %(message)s')
+
+    server = Server(port=options.port)
+    if options.tap_device:
+        tap = TAP(device=options.tap_device)
+    else:
+        tap = None
+    cli_server = CLIServer(_cli_socket_path())
+
+    clients = {}
+    cli_sessions = {}
+    mac_table = {}
+    rlist = [server.socket, cli_server.socket]
+    if tap:
+        rlist.append(tap.socket)
+
+    queued_frames = queue.Queue()
+
+    try:
+        log_event(logging.INFO, 'SYS', 'START', "Awaiting connections and packets")
+        while True:
+            (ready, _, _) = select(rlist, [], [], SELECT_TIMEOUT)
+            age_mac_table(mac_table)
+            for socket in ready:
+                if tap and socket == tap.socket:
+                    frames = tap.receive()
+                    if frames:
+                        for frame in frames:
+                            if learn_source(mac_table, tap, tap, frame.src_mac, options.tap_mac_age) == 'ok':
+                                queued_frames.put((tap, frame))
+
+
+                elif socket == server.socket:
+                    client = server.receive()
+                    if client:
+                        log_event(logging.INFO, 'LINK', 'CLIENTUP', "Client %r connected", client)
+                        clients[client.socket] = client
+                        rlist.append(client.socket)
+
+                elif socket == cli_server.socket:
+                    session = cli_server.receive()
+                    if session:
+                        log_event(logging.INFO, 'LINK', 'CLIUP', "CLI session %r connected", session)
+                        cli_sessions[session.socket] = session
+                        rlist.append(session.socket)
+                        session.send("% ")
+
+                elif socket in cli_sessions:
+                    session = cli_sessions[socket]
+                    lines = session.receive_lines()
+                    if lines is None:
+                        log_event(logging.INFO, 'LINK', 'CLIDOWN', "CLI session %r disconnected", session)
+                        del cli_sessions[socket]
+                        rlist.remove(socket)
+                    else:
+                        for line in lines:
+                            if not line:
+                                continue
+                            try:
+                                result = resolve_cli_command(line.split())
+                                if isinstance(result, str):
+                                    session.send(result + "\n% ")
+                                    continue
+                                handler, arg = result
+                                output = handler(arg, clients, tap, mac_table, rlist)
+                            except Exception as exc:
+                                # A bug in a CLI handler must never take the
+                                # switch down with it - same discipline as
+                                # the transmit() guards elsewhere.
+                                log_event(logging.ERROR, 'SYS', 'CLIERROR',
+                                          "CLI command %r raised %s: %s",
+                                          line, type(exc).__name__, exc)
+                                session.send("% Internal error processing command\n% ")
+                                continue
+                            if output is None:
+                                log_event(logging.INFO, 'LINK', 'CLIDOWN',
+                                          "CLI session %r disconnected", session)
+                                if session.socket:
+                                    session.socket.close()
+                                    session.socket = None
+                                del cli_sessions[socket]
+                                rlist.remove(socket)
+                                break
+                            session.send(output + "\n% ")
+
+                elif socket in clients:
+                    client = clients[socket]
+                    frames = client.receive()
+                    if frames is None:
+                        # They disconnected, remove from our list
+                        log_event(logging.INFO, 'LINK', 'CLIENTDOWN', "Client %r disconnected", client)
+                        purge_mac_table_for_port(mac_table, client)
+                        del clients[socket]
+                        rlist.remove(socket)
+                    else:
+                        for frame in frames:
+                            status = learn_source(mac_table, client, tap, frame.src_mac, options.tap_mac_age)
+                            if status == 'conflict':
+                                log_event(logging.WARNING, 'PORTSEC', 'KICK',
+                                          "Disconnected client %r (duplicate MAC)", client)
+                                client.socket.close()
+                                client.socket = None
+                                purge_mac_table_for_port(mac_table, client)
+                                del clients[socket]
+                                rlist.remove(socket)
+                                break
+                            elif status == 'ok':
+                                queued_frames.put((client, frame))
+
+                # Let's try sending the frames to all the clients
+                if not queued_frames.empty():
+                    ports = list(clients.values())
+                    if tap:
+                        ports.append(tap)
+
+                    while True:
+                        try:
+                            (receiver_port, frame) = queued_frames.get_nowait()
+                            log_event(logging.DEBUG, 'FRAME', 'DISTRIB', "type &%04x (%i bytes) from %r",
+                                      frame.frame_type, len(frame.data), receiver_port)
+                            for port in resolve_targets(mac_table, frame.dst_mac, ports, receiver_port):
+                                log_event(logging.DEBUG, 'FRAME', 'TX', "to port %r", port)
+                                port.transmit(frame)
+                        except queue.Empty:
+                            break
+
+                    # A transmit() above may have discovered a dead client;
+                    # drop it the same way a failed receive() would.
+                    for stale_socket, stale_client in list(clients.items()):
+                        if not stale_client.socket:
+                            log_event(logging.INFO, 'LINK', 'CLIENTDOWN', "Client %r disconnected", stale_client)
+                            purge_mac_table_for_port(mac_table, stale_client)
+                            del clients[stale_socket]
+                            rlist.remove(stale_socket)
+
+    except KeyboardInterrupt:
+        log_event(logging.INFO, 'SYS', 'SHUTDOWN', "Switch terminated.")
+    finally:
+        cli_server.close()

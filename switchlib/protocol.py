@@ -1,0 +1,210 @@
+"""The wire protocols the switch speaks: JSON-encoded ethernet frames over
+TCP (Client/Server) and raw ethernet frames over a tun/tap device (TAP)."""
+
+import base64
+import fcntl
+import json
+import logging
+import os
+import socket
+import struct
+import sys
+
+from .logutil import log_event
+
+
+class Frame(object):
+
+    def __init__(self, data, frame_type, src_mac, dst_mac):
+        self.data = data
+        self.frame_type = frame_type
+        self.src_mac = src_mac
+        self.dst_mac = dst_mac
+
+
+class Client(object):
+    """
+    Client holds a client to whom we have connected - we exchange frames.
+    """
+    read_size = 1024 * 64
+    max_pending = 1024 * 1024  # bytes buffered waiting for a '\n' before we give up
+                               # on the client - a real frame line is a couple of KB.
+
+    def __init__(self, socket):
+        self.socket = socket
+        self.name = socket.getpeername()
+        self.socket_read = []
+
+    def __repr__(self):
+        return "<{}({})>".format(self.__class__.__name__,
+                                 self.name)
+
+    def pending_size(self):
+        return sum(len(chunk) for chunk in self.socket_read)
+
+    def frame_to_json(self, frame):
+        send_data = {
+                'frame_type': frame.frame_type,
+                'src': frame.src_mac,
+                'dst': frame.dst_mac,
+                'data': base64.b64encode(frame.data).decode('ascii'),
+            }
+        return json.dumps(send_data)
+
+    def json_to_frame(self, json_line):
+        try:
+            recv_data = json.loads(json_line)
+
+            data = base64.b64decode(recv_data['data'])
+            frame_type = recv_data['frame_type']
+
+            src_mac = recv_data['src']
+            if not isinstance(src_mac, list) or len(src_mac) != 6:
+                raise ValueError("src address malformed (received %r)" % (src_mac,))
+
+            dst_mac = recv_data['dst']
+            if not isinstance(dst_mac, list) or len(dst_mac) != 6:
+                raise ValueError("dst address malformed (received %r)" % (dst_mac,))
+
+        except Exception:
+            return None
+        return Frame(data, frame_type, src_mac, dst_mac)
+
+    def transmit(self, frame):
+        if not self.socket:
+            # A previous transmit in this batch already found the peer gone.
+            return
+
+        json_data = self.frame_to_json(frame)
+        try:
+            self.socket.sendall((json_data + "\n").encode('utf-8'))
+        except OSError:
+            # The peer disconnected between our last receive() and this
+            # transmit() - tear down the same way receive() would.
+            self.socket.close()
+            self.socket = None
+
+    def receive(self):
+        """
+        Return a list of frames or None if disconnected.
+        """
+        if not self.socket:
+            # We're closed, so nothing to receive - report as disconnected.
+            return None
+
+        frames = []
+
+        try:
+            data = self.socket.recv(self.read_size)
+        except socket.error:
+            # Any socket error means that we're had a disconnect
+            data = b''
+        if not data:
+            # No data means that we were disconnected, so we drop the connection
+            self.socket.close()
+            self.socket = None
+            return None
+
+        while b'\n' in data:
+            (left, data) = data.split(b'\n', 1)
+            self.socket_read.append(left)
+            try:
+                frame = self.json_to_frame(b''.join(self.socket_read).decode('utf-8'))
+                if frame:
+                    frames.append(frame)
+            except Exception as exc:
+                log_event(logging.WARNING, 'FRAME', 'BADFRAME', "Could not process frame: %s", exc)
+                pass
+            self.socket_read = []
+        if data:
+            self.socket_read.append(data)
+            if self.pending_size() > self.max_pending:
+                log_event(logging.WARNING, 'FRAME', 'OVERFLOW',
+                          "Dropping %r: %i bytes buffered with no complete line (limit %i)",
+                          self, self.pending_size(), self.max_pending)
+                self.socket.close()
+                self.socket = None
+                return None
+
+        return frames
+
+
+class Server(object):
+
+    def __init__(self, host='', port=33445):
+        self.host = host
+        self.port = port
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind((self.host, self.port))
+        self.socket.listen(5)
+
+    def receive(self):
+        """
+        Receive from listening socket - we got a connection.
+
+        There's apparently someone waiting on the socket, so we need to accept their connection
+        """
+        try:
+            (conn, _) = self.socket.accept()
+            # We got a connection - give them a client. Small, latency-sensitive
+            # frames rather than bulk transfer, so disable Nagle's algorithm.
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return Client(conn)
+        except Exception as exc:
+            log_event(logging.WARNING, 'SYS', 'ACCEPTFAIL', "accept() failed: %s", exc)
+        return None
+
+
+class TAP(object):
+    read_size = 1024 * 64
+
+    # Linux constants
+    TUNSETIFF = 0x400454ca
+    IFF_TAP = 0x0002
+    IFF_NO_PI = 0x1000
+
+
+    def __init__(self, device='tap0'):
+        # On macOS, `device` is a file path to the tap device itself; on
+        # Linux it's the interface name to attach to via the shared
+        # /dev/net/tun clone device (TUNSETIFF) - there's no per-interface
+        # file to open directly.
+        path = device if sys.platform == 'darwin' else '/dev/net/tun'
+        self.socket = os.open(path, os.O_RDWR)
+        if sys.platform != 'darwin':
+            ifr = struct.pack('16sH', device.encode('utf-8'), self.IFF_TAP | self.IFF_NO_PI)
+            fcntl.ioctl(self.socket, self.TUNSETIFF, ifr)
+        self.name = device
+
+    def __repr__(self):
+        return "<{}({})>".format(self.__class__.__name__,
+                                 self.name)
+
+    def transmit(self, frame):
+        src_mac = bytes(bytearray(frame.src_mac))
+        dst_mac = bytes(bytearray(frame.dst_mac))
+        frame_type = struct.pack('>H', frame.frame_type)
+        packet = b''.join([dst_mac, src_mac, frame_type, frame.data])
+        try:
+            os.write(self.socket, packet)
+        except OSError as exc:
+            log_event(logging.WARNING, 'LINK', 'TAPWRITEFAIL',
+                      "Failed to write to tap %r: %s (dropping this frame, tap stays up)", self, exc)
+
+    def receive(self):
+        frame = os.read(self.socket, self.read_size)
+
+        # Framing format:
+        # 6 bytes:  Destination MAC
+        # 6 bytes:  Source MAC
+        # 2 bytes:  Ethernet type (eg 0x800)
+        # ...       Payload
+
+        dst_mac = list(frame[0:6])
+        src_mac = list(frame[6:12])
+        (frame_type,) = struct.unpack('>H', frame[12:14])
+        data = frame[14:]
+
+        return [Frame(data, frame_type, src_mac, dst_mac)]

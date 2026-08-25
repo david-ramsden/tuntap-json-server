@@ -34,7 +34,7 @@ Because this switch is designed to be reachable by many mutually-untrusting clie
     ./tap_jsonserver.py [options]
 
 * `--port <port>` - TCP port to listen on for client connections (default: `33445`).
-* `--tap-device <device>` - tap device to attach to: a file path on macOS, an interface name on Linux (see "Setting up the TAP" in `tap_jsonserver.py` for platform-specific setup). Supplying this enables the tap; omit it to run without one.
+* `--tap-device <device>` - tap device to attach to: a file path on macOS, an interface name on Linux (see "Setting up the TAP" below for platform-specific setup). Supplying this enables the tap; omit it to run without one.
 * `--tap-mac-age <seconds>` - how long a MAC address learned via the tap is remembered with no traffic before it's aged out of the switch's MAC table (default: `300`).
 * `--log-level <LEVEL>` - logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` (default: `INFO`).
 
@@ -45,6 +45,48 @@ When no external connection is required, a tap is unnecessary and the service ca
 With a tap attached (Linux example):
 
     ./tap_jsonserver.py --port <port number> --tap-device tap0
+
+## Setting up the TAP
+
+On macOS, this seems to be partially achievable by:
+
+We use the tuntap driver - you will need this to be installed.
+
+Create a new bridge through the network configuration, using the interface you want to access the network from:
+
+* Go to Settings->Network.
+* Select the cog under the interfaces select 'Manage virtual interfaces'
+* Add an interface.
+* Give it an appropriate name (I chose 'Wifi Bridge')
+* Select the interface you want to bridge (eg the Wifi interface)
+* This will then tell you the BSD name of the bridge
+
+To get the data to be written to the tap, it is necessary to bring the tap interface up:
+
+* `ifconfig <tap interface> up`
+
+If you want to communicate with the outside world (not just with yourself), you will need to add the tap to the bridge:
+
+* `ifconfig bridge1 addm <tap interface>`
+
+It may be necessary to configure the system to forward packets:
+
+* `sysctl -w net.link.ether.inet.proxyall=1`
+* `sysctl -w net.inet.ip.forwarding=1`
+
+Even still, I couldn't get ICMP packets to make it all the way through the wifi interface.
+
+On Linux you can set things up with:
+
+Create an interface which you will use for the communication:
+
+* `tunctl -t <tap name>`
+
+Create a bridge for your interfaces you will group together:
+
+* `brctl addbr br0`
+* `brctl addif br0 <bridged interface>`
+* `brctl addif br0 <tap interface>`
 
 ## Console
 
