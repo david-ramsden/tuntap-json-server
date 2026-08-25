@@ -426,12 +426,10 @@ def setup_argparse():
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--port', type=int, action='store', default=33445,
                         help="Port to listen for connections on")
-    parser.add_argument('--tap-enable', action='store_true',
-                        help="Enable use of the tap")
-    parser.add_argument('--tap-device', action='store',
-                        default='/dev/tap0' if sys.platform == 'darwin' else 'tap0',
+    parser.add_argument('--tap-device', action='store', default=None,
                         help="Tap device to attach to: a file path on macOS, "
-                             "an interface name on Linux")
+                             "an interface name on Linux. Supplying this enables "
+                             "the tap; omit it to run without one")
     parser.add_argument('--tap-mac-age', type=float, action='store', default=300.0,
                         help="Seconds of inactivity before a MAC address learned via "
                              "the tap is aged out of the switch's MAC table")
@@ -448,7 +446,7 @@ def main():
     logging.basicConfig(level=getattr(logging, options.log_level), format='%(asctime)s %(message)s')
 
     server = Server(port=options.port)
-    if options.tap_enable:
+    if options.tap_device:
         tap = TAP(device=options.tap_device)
     else:
         tap = None
