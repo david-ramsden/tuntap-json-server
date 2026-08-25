@@ -93,6 +93,8 @@ def main():
         log_event(logging.INFO, 'SYS', 'START', "Awaiting connections and packets")
         while True:
             wlist = [sock for sock, client in clients.items() if client.wants_write()]
+            if tap and tap.wants_write():
+                wlist.append(tap.socket)
             (ready, writable, _) = select(rlist, wlist, [], SELECT_TIMEOUT)
 
             now = time.monotonic()
@@ -104,7 +106,10 @@ def main():
                            # that has gone away and been replaced by a new one
 
             for sock in writable:
-                clients[sock].flush()
+                if tap and sock == tap.socket:
+                    tap.flush()
+                else:
+                    clients[sock].flush()
             _drop_dead_clients(clients, rlist, mac_table)
 
             for socket in ready:

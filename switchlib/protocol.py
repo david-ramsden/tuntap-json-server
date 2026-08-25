@@ -221,6 +221,8 @@ class Server(object):
 
 class TAP(object):
     read_size = 1024 * 64
+    max_write_pending = 1024 * 1024  # bytes queued for a congested tap before we
+                                     # start dropping new frames rather than grow further
 
     # Linux constants
     TUNSETIFF = 0x400454ca
@@ -234,31 +236,72 @@ class TAP(object):
         # /dev/net/tun clone device (TUNSETIFF) - there's no per-interface
         # file to open directly.
         path = device if sys.platform == 'darwin' else '/dev/net/tun'
-        self.socket = os.open(path, os.O_RDWR)
+        # Non-blocking so a congested tap (its queue can't drain as fast as
+        # we're writing) can never block the main select() loop - same
+        # discipline as Client, see Client.flush().
+        self.socket = os.open(path, os.O_RDWR | os.O_NONBLOCK)
         if sys.platform != 'darwin':
             ifr = struct.pack('16sH', device.encode('utf-8'), self.IFF_TAP | self.IFF_NO_PI)
             fcntl.ioctl(self.socket, self.TUNSETIFF, ifr)
         self.name = device
+        self.write_buffer = bytearray()
 
     def __repr__(self):
         return "<{}({})>".format(self.__class__.__name__,
                                  self.name)
 
+    def wants_write(self):
+        """Whether the main loop should watch this tap for writability."""
+        return bool(self.write_buffer)
+
     def transmit(self, frame):
+        packet = frame.to_ethernet_bytes()
+        if len(self.write_buffer) + len(packet) > self.max_write_pending:
+            # Unlike a slow Client, there's no connection to drop here - the
+            # tap has to stay up. So the tap's own equivalent of a NIC's tx
+            # ring dropping packets under congestion is to drop the newest
+            # frame rather than let the buffer grow without bound.
+            log_event(logging.WARNING, 'LINK', 'TAPOVERFLOW',
+                      "Dropping frame to tap %r: %i bytes already queued for a congested tap (limit %i)",
+                      self, len(self.write_buffer), self.max_write_pending)
+            return
+        self.write_buffer += packet
+        self.flush()
+
+    def flush(self):
+        """Send as much of the buffered output as the tap will accept right
+        now, without blocking. The main loop calls this again once select()
+        reports the tap writable, to drain the rest."""
+        if not self.write_buffer:
+            return
         try:
-            os.write(self.socket, frame.to_ethernet_bytes())
+            sent = os.write(self.socket, self.write_buffer)
+            del self.write_buffer[:sent]
+        except BlockingIOError:
+            return
         except OSError as exc:
             log_event(logging.WARNING, 'LINK', 'TAPWRITEFAIL',
-                      "Failed to write to tap %r: %s (dropping this frame, tap stays up)", self, exc)
+                      "Failed to write to tap %r: %s (dropping queued data, tap stays up)", self, exc)
+            self.write_buffer.clear()
 
     def receive(self):
-        frame = os.read(self.socket, self.read_size)
+        try:
+            frame = os.read(self.socket, self.read_size)
+        except OSError as exc:
+            log_event(logging.WARNING, 'LINK', 'TAPREADFAIL',
+                      "Failed to read from tap %r: %s (tap stays up)", self, exc)
+            return []
 
         # Framing format:
         # 6 bytes:  Destination MAC
         # 6 bytes:  Source MAC
         # 2 bytes:  Ethernet type (eg 0x800)
         # ...       Payload
+
+        if len(frame) < 14:
+            log_event(logging.WARNING, 'LINK', 'TAPSHORTREAD',
+                      "Short read from tap %r: %i bytes (dropping)", self, len(frame))
+            return []
 
         dst_mac = list(frame[0:6])
         src_mac = list(frame[6:12])
