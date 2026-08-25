@@ -290,15 +290,17 @@ class TAP(object):
     IFF_NO_PI = 0x1000
 
 
-    def __init__(self, filename='/dev/tap0', device='tap0'):
-        if sys.platform == 'darwin':
-            self.socket = os.open(filename, os.O_RDWR)
-            self.name = filename
-        else:
-            self.socket = os.open('/dev/net/tun', os.O_RDWR)
+    def __init__(self, device='tap0'):
+        # On macOS, `device` is a file path to the tap device itself; on
+        # Linux it's the interface name to attach to via the shared
+        # /dev/net/tun clone device (TUNSETIFF) - there's no per-interface
+        # file to open directly.
+        path = device if sys.platform == 'darwin' else '/dev/net/tun'
+        self.socket = os.open(path, os.O_RDWR)
+        if sys.platform != 'darwin':
             ifr = struct.pack('16sH', device.encode('utf-8'), self.IFF_TAP | self.IFF_NO_PI)
             fcntl.ioctl(self.socket, self.TUNSETIFF, ifr)
-            self.name = device
+        self.name = device
 
     def __repr__(self):
         return "<{}({})>".format(self.__class__.__name__,
@@ -426,10 +428,10 @@ def setup_argparse():
                         help="Port to listen for connections on")
     parser.add_argument('--tap-enable', action='store_true',
                         help="Enable use of the tap")
-    parser.add_argument('--tap-filename', action='store', default='/dev/tap0',
-                        help="Tap filename to connect to (on macOS)")
-    parser.add_argument('--tap-device', action='store', default='tap0',
-                        help="Tap device to connect to (on Linux)")
+    parser.add_argument('--tap-device', action='store',
+                        default='/dev/tap0' if sys.platform == 'darwin' else 'tap0',
+                        help="Tap device to attach to: a file path on macOS, "
+                             "an interface name on Linux")
     parser.add_argument('--tap-mac-age', type=float, action='store', default=300.0,
                         help="Seconds of inactivity before a MAC address learned via "
                              "the tap is aged out of the switch's MAC table")
@@ -447,7 +449,7 @@ def main():
 
     server = Server(port=options.port)
     if options.tap_enable:
-        tap = TAP()
+        tap = TAP(device=options.tap_device)
     else:
         tap = None
 
