@@ -4,6 +4,7 @@ CLISession), its Cisco-style commands, and the partial-match resolver."""
 import logging
 import os
 import socket
+import stat
 import time
 
 from .logutil import log_event
@@ -15,10 +16,17 @@ class CLIServer(object):
 
     def __init__(self, path):
         self.path = path
-        if os.path.exists(path):
-            os.unlink(path)  # stale socket file from an unclean shutdown
+        try:
+            # Only remove it if it's actually a socket - a stale one from an
+            # unclean shutdown. Anything else (e.g. a symlink planted by
+            # another local user) is left alone rather than unlinked.
+            if stat.S_ISSOCK(os.lstat(path).st_mode):
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.bind(path)
+        os.chmod(path, 0o600)  # CLI has no auth of its own - restrict to the owner
         self.socket.listen(5)
 
     def receive(self):

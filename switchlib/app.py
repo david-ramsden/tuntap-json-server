@@ -103,6 +103,7 @@ def main():
                     else:
                         for line in lines:
                             if not line:
+                                session.send("% ")
                                 continue
                             try:
                                 result = resolve_cli_command(line.split())

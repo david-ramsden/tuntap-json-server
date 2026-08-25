@@ -51,19 +51,31 @@ class Client(object):
             }
         return json.dumps(send_data)
 
+    @staticmethod
+    def _valid_mac(value):
+        """A MAC is a list of 6 ints in 0-255 - not just any 6-element list.
+        Anything looser (nested lists, strings, bools, out-of-range ints) can
+        later blow up as an unhashable/unpackable mac_table key or TAP frame."""
+        return (isinstance(value, list) and len(value) == 6 and
+                all(isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 255 for b in value))
+
     def json_to_frame(self, json_line):
         try:
             recv_data = json.loads(json_line)
 
             data = base64.b64decode(recv_data['data'])
+
             frame_type = recv_data['frame_type']
+            if (not isinstance(frame_type, int) or isinstance(frame_type, bool)
+                    or not (0 <= frame_type <= 0xffff)):
+                raise ValueError("frame_type malformed (received %r)" % (frame_type,))
 
             src_mac = recv_data['src']
-            if not isinstance(src_mac, list) or len(src_mac) != 6:
+            if not self._valid_mac(src_mac):
                 raise ValueError("src address malformed (received %r)" % (src_mac,))
 
             dst_mac = recv_data['dst']
-            if not isinstance(dst_mac, list) or len(dst_mac) != 6:
+            if not self._valid_mac(dst_mac):
                 raise ValueError("dst address malformed (received %r)" % (dst_mac,))
 
         except Exception:
