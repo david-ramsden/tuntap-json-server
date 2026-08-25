@@ -28,3 +28,19 @@ When no external connection is required, a tap is unnecessary and the service ca
 
     ./tap_jsonserver.py --port <port number>
 
+## Console
+
+Every run of the switch opens a CLI console on a Unix domain socket called `console0`, next to the script itself. Connect to it locally with `socat` or `nc`:
+
+    socat - UNIX-CONNECT:console0
+
+Commands support Cisco-style partial matching, including matching a whole command when the words given are unambiguous even if incomplete (e.g. `sh int` or just `show mac` both work):
+
+* `show interfaces status` - lists connected clients and the tap (if configured), each with a port number.
+* `show mac address-table` - lists learned MAC addresses, their owning port (matching `show interfaces status`), and (for tap-learned entries) time until they age out.
+* `clear mac address-table` - forgets all learned MAC addresses. This only affects switching decisions (traffic floods until relearned, which happens automatically on the next frame from each source) - it does not disconnect anyone.
+* `clear interface <port>` - disconnects the client with that port (from `show interfaces status`).
+* `show logging` / `logging level <LEVEL>` - reads or changes the logging verbosity while running.
+* `help` (or `?`) - lists the available commands.
+* `exit` - closes the console session.
+
