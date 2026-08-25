@@ -28,6 +28,11 @@ def log_event(level, facility, mnemonic, message, *args):
     is non-empty (LogRecord.getMessage() skips it entirely for an empty
     args tuple), so an un-doubled '%' would otherwise reach the log verbatim.
     """
+    if not LOG.isEnabledFor(level):
+        # Skip the tag formatting below too - this runs on the per-frame,
+        # per-destination hot path at DEBUG, so it shouldn't cost anything
+        # when DEBUG logging is off (the default).
+        return
     tag = "%s-%d-%s: " % (facility, _SEVERITY[level], mnemonic)
     if args:
         LOG.log(level, "%%" + tag + message, *args)

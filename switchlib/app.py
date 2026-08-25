@@ -4,8 +4,9 @@ switching, and console pieces together."""
 import argparse
 import logging
 import os
-import queue
 import sys
+import time
+from collections import deque
 from select import select
 
 from .console import CLIServer, resolve_cli_command
@@ -16,6 +17,12 @@ from .switching import age_mac_table, learn_source, purge_mac_table_for_port, re
 
 SELECT_TIMEOUT = 5.0  # seconds; poll granularity so select() wakes periodically
                       # to age out stale TAP-learned MAC entries even when idle.
+
+AGE_CHECK_INTERVAL = 1.0  # seconds; how often to bother scanning the whole MAC
+                          # table for expired entries - no need to do it on every
+                          # select() wakeup, which can happen many times a second
+                          # under load. Aging deadlines are on the order of minutes
+                          # (--tap-mac-age), so a second of slack is irrelevant.
 
 
 def _cli_socket_path():
@@ -42,6 +49,17 @@ def setup_argparse():
     return parser
 
 
+def _drop_dead_clients(clients, rlist, mac_table):
+    """Remove any client whose socket was closed by a failed receive() or
+    flush() (e.g. a slow reader that overflowed its write buffer)."""
+    for stale_socket, stale_client in list(clients.items()):
+        if not stale_client.socket:
+            log_event(logging.INFO, 'LINK', 'CLIENTDOWN', "Client %r disconnected", stale_client)
+            purge_mac_table_for_port(mac_table, stale_client)
+            del clients[stale_socket]
+            rlist.remove(stale_socket)
+
+
 def main():
     parser = setup_argparse()
     options = parser.parse_args()
@@ -62,20 +80,31 @@ def main():
     if tap:
         rlist.append(tap.socket)
 
-    queued_frames = queue.Queue()
+    queued_frames = deque()
+    next_age_check = 0.0
 
     try:
         log_event(logging.INFO, 'SYS', 'START', "Awaiting connections and packets")
         while True:
-            (ready, _, _) = select(rlist, [], [], SELECT_TIMEOUT)
-            age_mac_table(mac_table)
+            wlist = [sock for sock, client in clients.items() if client.wants_write()]
+            (ready, writable, _) = select(rlist, wlist, [], SELECT_TIMEOUT)
+
+            now = time.monotonic()
+            if now >= next_age_check:
+                age_mac_table(mac_table)
+                next_age_check = now + AGE_CHECK_INTERVAL
+
+            for sock in writable:
+                clients[sock].flush()
+            _drop_dead_clients(clients, rlist, mac_table)
+
             for socket in ready:
                 if tap and socket == tap.socket:
                     frames = tap.receive()
                     if frames:
                         for frame in frames:
                             if learn_source(mac_table, tap, tap, frame.src_mac, options.tap_mac_age) == 'ok':
-                                queued_frames.put((tap, frame))
+                                queued_frames.append((tap, frame))
 
 
                 elif socket == server.socket:
@@ -154,33 +183,25 @@ def main():
                                 rlist.remove(socket)
                                 break
                             elif status == 'ok':
-                                queued_frames.put((client, frame))
+                                queued_frames.append((client, frame))
 
                 # Let's try sending the frames to all the clients
-                if not queued_frames.empty():
+                if queued_frames:
                     ports = list(clients.values())
                     if tap:
                         ports.append(tap)
 
-                    while True:
-                        try:
-                            (receiver_port, frame) = queued_frames.get_nowait()
-                            log_event(logging.DEBUG, 'FRAME', 'DISTRIB', "type &%04x (%i bytes) from %r",
-                                      frame.frame_type, len(frame.data), receiver_port)
-                            for port in resolve_targets(mac_table, frame.dst_mac, ports, receiver_port):
-                                log_event(logging.DEBUG, 'FRAME', 'TX', "to port %r", port)
-                                port.transmit(frame)
-                        except queue.Empty:
-                            break
+                    while queued_frames:
+                        (receiver_port, frame) = queued_frames.popleft()
+                        log_event(logging.DEBUG, 'FRAME', 'DISTRIB', "type &%04x (%i bytes) from %r",
+                                  frame.frame_type, len(frame.data), receiver_port)
+                        for port in resolve_targets(mac_table, frame.dst_mac, ports, receiver_port):
+                            log_event(logging.DEBUG, 'FRAME', 'TX', "to port %r", port)
+                            port.transmit(frame)
 
                     # A transmit() above may have discovered a dead client;
                     # drop it the same way a failed receive() would.
-                    for stale_socket, stale_client in list(clients.items()):
-                        if not stale_client.socket:
-                            log_event(logging.INFO, 'LINK', 'CLIENTDOWN', "Client %r disconnected", stale_client)
-                            purge_mac_table_for_port(mac_table, stale_client)
-                            del clients[stale_socket]
-                            rlist.remove(stale_socket)
+                    _drop_dead_clients(clients, rlist, mac_table)
 
     except KeyboardInterrupt:
         log_event(logging.INFO, 'SYS', 'SHUTDOWN', "Switch terminated.")

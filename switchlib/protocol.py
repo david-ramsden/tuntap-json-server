@@ -20,6 +20,11 @@ class Frame(object):
         self.frame_type = frame_type
         self.src_mac = src_mac
         self.dst_mac = dst_mac
+        # Filled in lazily by the first Client that transmits this frame, and
+        # reused by every other Client it's also flooded to - a broadcast/
+        # multicast frame would otherwise re-run json.dumps()+base64 once
+        # per destination client.
+        self.encoded = None
 
 
 class Client(object):
@@ -29,11 +34,13 @@ class Client(object):
     read_size = 1024 * 64
     max_pending = 1024 * 1024  # bytes buffered waiting for a '\n' before we give up
                                # on the client - a real frame line is a couple of KB.
+    max_write_pending = 1024 * 1024  # bytes queued for a slow reader before we give up
 
     def __init__(self, socket):
         self.socket = socket
         self.name = socket.getpeername()
         self.socket_read = []
+        self.write_buffer = bytearray()
 
     def __repr__(self):
         return "<{}({})>".format(self.__class__.__name__,
@@ -49,7 +56,9 @@ class Client(object):
                 'dst': frame.dst_mac,
                 'data': base64.b64encode(frame.data).decode('ascii'),
             }
-        return json.dumps(send_data)
+        # Compact separators: no functional difference, just fewer bytes for
+        # the receiver to ship and parse.
+        return json.dumps(send_data, separators=(',', ':'))
 
     @staticmethod
     def _valid_mac(value):
@@ -87,12 +96,43 @@ class Client(object):
             # A previous transmit in this batch already found the peer gone.
             return
 
-        json_data = self.frame_to_json(frame)
+        if frame.encoded is None:
+            frame.encoded = (self.frame_to_json(frame) + "\n").encode('utf-8')
+        self.write_buffer += frame.encoded
+        self.flush()
+
+    def wants_write(self):
+        """Whether the main loop should watch this client for writability."""
+        return bool(self.socket) and bool(self.write_buffer)
+
+    def flush(self):
+        """Send as much of the buffered output as the socket will accept
+        right now, without blocking. The main loop calls this again once
+        select() reports the socket writable, to drain the rest - this is
+        what stops one slow reader from stalling delivery to every other
+        client (sockets are non-blocking; see Server.receive())."""
+        if not self.socket or not self.write_buffer:
+            return
+
         try:
-            self.socket.sendall((json_data + "\n").encode('utf-8'))
+            sent = self.socket.send(self.write_buffer)
+            del self.write_buffer[:sent]
+        except BlockingIOError:
+            # The socket's send buffer is full right now - nothing went out,
+            # but still fall through to the overflow check below: a peer
+            # that never reads at all would otherwise never hit it.
+            pass
         except OSError:
             # The peer disconnected between our last receive() and this
-            # transmit() - tear down the same way receive() would.
+            # transmit()/flush() - tear down the same way receive() would.
+            self.socket.close()
+            self.socket = None
+            return
+
+        if len(self.write_buffer) > self.max_write_pending:
+            log_event(logging.WARNING, 'FRAME', 'WRITEOVERFLOW',
+                      "Dropping %r: %i bytes queued for a slow reader (limit %i)",
+                      self, len(self.write_buffer), self.max_write_pending)
             self.socket.close()
             self.socket = None
 
@@ -163,6 +203,9 @@ class Server(object):
             # We got a connection - give them a client. Small, latency-sensitive
             # frames rather than bulk transfer, so disable Nagle's algorithm.
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Non-blocking so a full send buffer (slow/stalled peer) can never
+            # block the main select() loop - see Client.flush().
+            conn.setblocking(False)
             return Client(conn)
         except Exception as exc:
             log_event(logging.WARNING, 'SYS', 'ACCEPTFAIL', "accept() failed: %s", exc)
