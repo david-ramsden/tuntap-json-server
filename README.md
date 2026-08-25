@@ -14,25 +14,47 @@ The TCP server listens on port 33445 by default, awaiting connections from clien
 * `dst`:          Destination MAC address as a list of 6 integers.
 * `data`:         Data as base 64 encoded bytes.
 
-The server behaves as a MAC-learning Ethernet switch. Source MAC addresses are learned per connected client, and per the tap if one is configured:
+## MAC learning and port security
 
+The server behaves as a MAC-learning Ethernet switch, not a hub: it doesn't just replicate every frame to everyone.
+
+* Source MAC addresses are learned per connected client, and per the tap if one is configured.
 * A frame addressed to a known unicast MAC is delivered only to the client (or the tap) that owns it.
 * Broadcast, multicast, and frames addressed to an unknown MAC are flooded to every other connected client, and to the tap if configured.
-* A MAC address already learned on one client cannot be claimed by another client - the second client is disconnected instead.
-* A MAC address learned via the tap is not overridden by a client claiming it, and vice versa, until the tap-learned entry ages out from inactivity (`--tap-mac-age`, default 300 seconds) or the owning client disconnects.
 
+Because this switch is designed to be reachable by many mutually-untrusting clients, potentially over the open internet, while the tap bridges to a real network, it applies stricter rules than a typical switch about how a learned MAC address can change ownership:
+
+* **Client vs client (port security)**: a MAC address already learned on one client cannot be claimed by another client - the second client is disconnected instead, and the original owner is left alone.
+* **Client vs tap (a strict boundary, in both directions)**: a client can never silently take over a MAC currently attributed to the tap, and the tap can never silently take over a MAC currently attributed to a client. Either mismatch just drops the offending frame and logs it - nothing is disconnected, since there's no tap "connection" to drop.
+* An entry's ownership can only change in one of two ways: the owning client disconnecting (immediate), or a tap-learned entry ageing out from inactivity (`--tap-mac-age`, default 300 seconds). Once that happens, a fresh claim from either side is accepted normally.
+* The console's `clear mac address-table` command (see below) forgets all learned entries without disconnecting anyone - traffic just floods again until each source is relearned, which happens automatically on its next frame.
 
 ## Usage
+
+    ./tap_jsonserver.py [options]
+
+* `--port <port>` - TCP port to listen on for client connections (default: `33445`).
+* `--tap-device <device>` - tap device to attach to: a file path on macOS, an interface name on Linux (see "Setting up the TAP" in `tap_jsonserver.py` for platform-specific setup). Supplying this enables the tap; omit it to run without one.
+* `--tap-mac-age <seconds>` - how long a MAC address learned via the tap is remembered with no traffic before it's aged out of the switch's MAC table (default: `300`).
+* `--log-level <LEVEL>` - logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` (default: `INFO`).
 
 When no external connection is required, a tap is unnecessary and the service can be run on any system:
 
     ./tap_jsonserver.py --port <port number>
 
+With a tap attached (Linux example):
+
+    ./tap_jsonserver.py --port <port number> --tap-device tap0
+
 ## Console
 
-Every run of the switch opens a CLI console on a Unix domain socket called `console0`, next to the script itself. Connect to it locally with `socat` or `nc`:
+Every run of the switch opens a console on a Unix domain socket called `console0`, next to the script itself (fixed, not configurable, and gitignored). Connect to it locally with `socat`:
 
     socat - UNIX-CONNECT:console0
+
+or with `nc`:
+
+    nc -U console0
 
 Commands support Cisco-style partial matching, including matching a whole command when the words given are unambiguous even if incomplete (e.g. `sh int` or just `show mac` both work):
 
@@ -43,4 +65,3 @@ Commands support Cisco-style partial matching, including matching a whole comman
 * `show logging` / `logging level <LEVEL>` - reads or changes the logging verbosity while running.
 * `help` (or `?`) - lists the available commands.
 * `exit` - closes the console session.
-
