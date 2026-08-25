@@ -84,11 +84,6 @@ import os
 import sys
 from select import select
 
-use_scapy = False
-
-if use_scapy:
-    from scapy.all import Ether
-
 import base64
 import fcntl
 import json
@@ -96,105 +91,6 @@ import socket
 import struct
 import sys
 import queue
-
-
-class Dump(object):
-
-    def __init__(self, fh=None):
-        if fh is None:
-            fh = sys.stdout
-
-        self.offset_base = 0
-        self.fh = fh
-        self.columns = 16
-        self.offset_label = 'Offset'
-        self.text_label = 'Text'
-        self.indent = ''
-        self.width = 1  # Must be 1, 2, 4, 8
-        self.little_endian = True
-        self.heading = True
-        self.heading_every = 16
-        self.heading_breaks = True
-        self.text = True
-        self.text_high = False
-
-    def writeln(self, msg):
-        self.fh.write(msg + '\n')
-
-    def format_offset(self, offset):
-        return '{:8x}'.format(offset + self.offset_base)
-
-    def format_chars(self, data):
-        if self.text_high:
-            valid = lambda c: (c >= 32 and c < 0x7f) or (c > 0xa0)
-        else:
-            valid = lambda c: c >= 32 and c < 0x7f
-        return ''.join(chr(c) if valid(c) else '.' for c in data)
-
-    def show(self, data):
-        units = self.width
-        columns = (self.columns + self.width - 1) & ~(self.width - 1)
-
-        row_count = 0
-        rowtext = ''
-        for offset in range(0, len(data), columns):
-            if self.heading:
-                if (row_count % self.heading_every) == 0:
-                    if row_count != 0 and self.heading_breaks:
-                        self.writeln('')
-
-                    rowtitle = '{:>8}'.format(self.offset_label)
-                    if columns < 16:
-                        rowcolumns = ' '.join('+{:x}'.format(v) for v in range(0, columns, units))
-                    elif columns == 16:
-                        if self.offset_base % 16 == 0:
-                            rowcolumns = ' '.join('{:{}x}'.format(v, units * 2) for v in range(0, columns, units))
-                        else:
-                            rowcolumns = ' '.join('{:{}}'.format('+{:x}'.format(v), units * 2) for v in range(0, columns + (self.offset_base % 16), units))
-                    else:
-                        rowcolumns = '+'.join('{:{}x}'.format(v, units * 2) for v in range(0, columns, units))
-
-                    if self.text:
-                        rowtext = ' : {}'.format(self.text_label)
-                    self.writeln("{}{} : {}{}".format(self.indent,
-                                                      rowtitle,
-                                                      rowcolumns,
-                                                      rowtext))
-
-            rowdata = data[offset:offset + self.columns]
-            rowbytevalues = list(bytearray(rowdata))
-            if units == 1:
-                rowvalues = rowbytevalues
-            else:
-                if len(rowdata) % units != 0:
-                    rowdata += b'\x00' * (units - (len(rowdata) % units))
-                if units == 2:
-                    format_string = 'H'
-                elif units == 4:
-                    format_string = 'L'
-                elif units == 8:
-                    format_string = 'Q'
-                format_string = format_string * (len(rowdata) // units)
-                if self.little_endian:
-                    format_string = '<' + format_string
-                else:
-                    format_string = '>' + format_string
-                rowvalues = struct.unpack(format_string, rowdata)
-
-            rowdesc = ' '.join('{:0{}x}'.format(v, units * 2) for v in rowvalues)
-            if len(rowvalues) < self.columns // units:
-                rowdesc += ((' ' * (units * 2)) + ' ') * (self.columns // units - len(rowvalues))
-
-            if self.text:
-                rowchars = self.format_chars(rowbytevalues)
-                rowtext = ' : {}'.format(rowchars)
-            else:
-                rowtext = ''
-
-            rowtitle = self.format_offset(offset)
-
-            self.writeln("{}{} : {}{}".format(self.indent, rowtitle, rowdesc, rowtext))
-            row_count += 1
 
 
 class Frame(object):
@@ -211,7 +107,6 @@ class Client(object):
     Client holds a client to whom we have connected - we exchange frames.
     """
     read_size = 1024 * 64
-    debug_etherdriverjson = False
 
     def __init__(self, socket):
         self.socket = socket
@@ -246,21 +141,23 @@ class Client(object):
             if not isinstance(dst_mac, list) or len(dst_mac) != 6:
                 raise ValueError("dst address malformed (received %r)" % (dst_mac,))
 
-        except Exception as exc:
-            # FIXME: Debug option?
-            if self.debug_etherdriverjson:
-                print("Ethernet JSON frame invalid: %s" % (exc,))
+        except Exception:
             return None
         return Frame(data, frame_type, src_mac, dst_mac)
 
     def transmit(self, frame):
         if not self.socket:
-            print("transmit: pointless call when socket was closed")
-            # We're closed, so discard
+            # A previous transmit in this batch already found the peer gone.
             return
 
         json_data = self.frame_to_json(frame)
-        self.socket.sendall((json_data + "\n").encode('utf-8'))
+        try:
+            self.socket.sendall((json_data + "\n").encode('utf-8'))
+        except OSError:
+            # The peer disconnected between our last receive() and this
+            # transmit() - tear down the same way receive() would.
+            self.socket.close()
+            self.socket = None
 
     def receive(self):
         """
@@ -395,8 +292,6 @@ def main():
     parser = setup_argparse()
     options = parser.parse_args()
 
-    dumper = Dump()
-
     server = Server(port=options.port)
     if options.tap_enable:
         tap = TAP()
@@ -408,7 +303,7 @@ def main():
     if tap:
         rlist.append(tap.socket)
 
-    queued_frames = queue.LifoQueue()
+    queued_frames = queue.Queue()
 
     try:
         print("Awaiting connections and packets")
@@ -461,13 +356,16 @@ def main():
                                     continue
                                 print("Transmit to port %r" % (port,))
                                 port.transmit(frame)
-
-                                # Move this into the Frame class and reconstruct the ethernet frame?
-                                #if use_scapy:
-                                #    ether = Ether(frame)
-                                #    ether.show()
                         except queue.Empty:
                             break
+
+                    # A transmit() above may have discovered a dead client;
+                    # drop it the same way a failed receive() would.
+                    for stale_socket, stale_client in list(clients.items()):
+                        if not stale_client.socket:
+                            print("Disconnected client %r" % (stale_client,))
+                            del clients[stale_socket]
+                            rlist.remove(stale_socket)
 
     except KeyboardInterrupt:
         print("HUB terminated.")
