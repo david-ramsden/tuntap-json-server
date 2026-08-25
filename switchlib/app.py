@@ -11,6 +11,7 @@ from select import select
 
 from .console import CLIServer, resolve_cli_command
 from .logutil import log_event
+from .mirror import Mirror
 from .protocol import Server, TAP
 from .switching import age_mac_table, learn_source, purge_mac_table_for_port, resolve_targets
 
@@ -29,6 +30,10 @@ def _cli_socket_path():
     # Next to the originally-invoked script, regardless of which module this
     # function itself happens to live in - sys.argv[0], not __file__.
     return os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'console0')
+
+
+def _mirror_fifo_path():
+    return os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'mirror0')
 
 
 def setup_argparse():
@@ -72,6 +77,7 @@ def main():
     else:
         tap = None
     cli_server = CLIServer(_cli_socket_path())
+    mirror = Mirror(_mirror_fifo_path())
 
     clients = {}
     cli_sessions = {}
@@ -93,6 +99,9 @@ def main():
             if now >= next_age_check:
                 age_mac_table(mac_table)
                 next_age_check = now + AGE_CHECK_INTERVAL
+            mirror.tick()  # self-throttled; needed even when no frame arrives
+                           # to notice (see Mirror.tick()) a capture reader
+                           # that has gone away and been replaced by a new one
 
             for sock in writable:
                 clients[sock].flush()
@@ -195,6 +204,7 @@ def main():
                         (receiver_port, frame) = queued_frames.popleft()
                         log_event(logging.DEBUG, 'FRAME', 'DISTRIB', "type &%04x (%i bytes) from %r",
                                   frame.frame_type, len(frame.data), receiver_port)
+                        mirror.record(frame)
                         for port in resolve_targets(mac_table, frame.dst_mac, ports, receiver_port):
                             log_event(logging.DEBUG, 'FRAME', 'TX', "to port %r", port)
                             port.transmit(frame)
@@ -207,3 +217,4 @@ def main():
         log_event(logging.INFO, 'SYS', 'SHUTDOWN', "Switch terminated.")
     finally:
         cli_server.close()
+        mirror.close()

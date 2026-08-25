@@ -26,6 +26,13 @@ class Frame(object):
         # per destination client.
         self.encoded = None
 
+    def to_ethernet_bytes(self):
+        """The frame as it would appear on the wire: dst+src+ethertype+payload."""
+        return b''.join([bytes(bytearray(self.dst_mac)),
+                          bytes(bytearray(self.src_mac)),
+                          struct.pack('>H', self.frame_type),
+                          self.data])
+
 
 class Client(object):
     """
@@ -238,12 +245,8 @@ class TAP(object):
                                  self.name)
 
     def transmit(self, frame):
-        src_mac = bytes(bytearray(frame.src_mac))
-        dst_mac = bytes(bytearray(frame.dst_mac))
-        frame_type = struct.pack('>H', frame.frame_type)
-        packet = b''.join([dst_mac, src_mac, frame_type, frame.data])
         try:
-            os.write(self.socket, packet)
+            os.write(self.socket, frame.to_ethernet_bytes())
         except OSError as exc:
             log_event(logging.WARNING, 'LINK', 'TAPWRITEFAIL',
                       "Failed to write to tap %r: %s (dropping this frame, tap stays up)", self, exc)
